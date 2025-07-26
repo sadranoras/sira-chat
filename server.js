@@ -1,19 +1,15 @@
-// server.js (با PostgreSQL)
 import express from 'express';
 import session from 'express-session';
-import bcrypt from 'bcryptjs';
-import pg from 'pg';
+import bcrypt from 'bcrypt';
+import sqlite3 from 'sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // لینک PostgreSQL از Render
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-});
+const sqlite = sqlite3.verbose();
+const db = new sqlite.Database('./chat.db');
 
 const app = express();
 
@@ -28,39 +24,33 @@ app.use(session({
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ساخت جداول در صورت نیاز
-async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      username TEXT UNIQUE,
-      password TEXT,
-      role TEXT DEFAULT 'user'
-    );
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id SERIAL PRIMARY KEY,
-      sender_id INTEGER REFERENCES users(id),
-      sender TEXT,
-      receiver_id INTEGER REFERENCES users(id),
-      content TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    password TEXT,
+    role TEXT DEFAULT 'user'
+  )`);
 
-  const { rows } = await pool.query("SELECT * FROM users WHERE role='admin'");
-  if (rows.length === 0) {
-    const hashed = await bcrypt.hash('admin123', 10);
-    await pool.query(
-      "INSERT INTO users (username, password, role) VALUES ($1, $2, 'admin')",
-      ['admin', hashed]
-    );
-    console.log('ادمین نمونه ساخته شد: username=admin, password=admin123');
-  }
-}
+  db.run(`CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id INTEGER,
+    sender TEXT,
+    receiver_id INTEGER,
+    content TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(sender_id) REFERENCES users(id),
+    FOREIGN KEY(receiver_id) REFERENCES users(id)
+  )`);
 
-initDB();
+  db.get("SELECT * FROM users WHERE role='admin'", (err, row) => {
+    if (!row) {
+      const hashed = bcrypt.hashSync('admin123', 10);
+      db.run(`INSERT INTO users (username, password, role) VALUES (?, ?, 'admin')`, ['admin', hashed]);
+      console.log('ادمین نمونه ساخته شد: username=admin, password=admin123');
+    }
+  });
+});
 
 function requireLogin(req, res, next) {
   if (!req.session.user) return res.status(401).send('لطفا وارد شوید');
@@ -75,30 +65,35 @@ function requireAdmin(req, res, next) {
 app.post('/register', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).send('نام کاربری و رمز عبور الزامی است');
+
   try {
     const hashed = await bcrypt.hash(password, 10);
-    await pool.query('INSERT INTO users (username, password) VALUES ($1, $2)', [username, hashed]);
-    res.send('ثبت‌نام با موفقیت انجام شد');
-  } catch (err) {
-    if (err.code === '23505') return res.status(400).send('نام کاربری قبلا استفاده شده');
+    db.run('INSERT INTO users (username, password) VALUES (?, ?)', [username, hashed], function (err) {
+      if (err) {
+        if (err.message.includes('UNIQUE')) return res.status(400).send('نام کاربری قبلا استفاده شده');
+        return res.status(500).send('خطای سرور');
+      }
+      res.send('ثبت‌نام با موفقیت انجام شد');
+    });
+  } catch (error) {
     res.status(500).send('خطای سرور');
   }
 });
 
-app.post('/login', async (req, res) => {
+app.post('/login', (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).send('نام کاربری و رمز عبور الزامی است');
-  try {
-    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-    const user = result.rows[0];
+
+  db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
+    if (err) return res.status(500).send('خطای سرور');
     if (!user) return res.status(400).send('نام کاربری یا رمز عبور اشتباه است');
+
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(400).send('نام کاربری یا رمز عبور اشتباه است');
+
     req.session.user = { id: user.id, username: user.username, role: user.role };
     res.send('ورود موفق');
-  } catch (err) {
-    res.status(500).send('خطای سرور');
-  }
+  });
 });
 
 app.get('/logout', (req, res) => {
@@ -111,76 +106,99 @@ app.get('/profile', requireLogin, (req, res) => {
   res.json(req.session.user);
 });
 
-app.get('/users', requireLogin, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT id, username, role FROM users');
-    res.json(result.rows);
-  } catch {
-    res.status(500).send('خطا در دریافت کاربران');
-  }
+app.get('/users', requireLogin, (req, res) => {
+  db.all('SELECT id, username, role FROM users', (err, rows) => {
+    if (err) return res.status(500).send('خطا در دریافت کاربران');
+    res.json(rows);
+  });
 });
 
-app.get('/messages', requireLogin, async (req, res) => {
+// ✅ این بخش اصلاح شد
+app.get('/messages', requireLogin, (req, res) => {
   const userId = req.session.user.id;
-  try {
-    const result = await pool.query(
-      `SELECT * FROM messages
-       WHERE receiver_id IS NULL OR sender_id = $1 OR receiver_id = $1
-       ORDER BY created_at ASC`,
-      [userId]
-    );
-    res.json(result.rows);
-  } catch {
-    res.status(500).send('خطا در دریافت پیام‌ها');
+  const isAdmin = req.session.user.role === 'admin';
+
+  let sql;
+  let params = [];
+
+  if (isAdmin) {
+    sql = `SELECT * FROM messages ORDER BY created_at ASC`;
+  } else {
+    sql = `
+      SELECT * FROM messages
+      WHERE receiver_id IS NULL
+      OR sender_id = ?
+      OR receiver_id = ?
+      ORDER BY created_at ASC
+    `;
+    params = [userId, userId];
   }
+
+  db.all(sql, params, (err, rows) => {
+    if (err) return res.status(500).send('خطا در دریافت پیام‌ها');
+    res.json(rows);
+  });
 });
 
-app.post('/message', requireLogin, async (req, res) => {
+app.post('/message', requireLogin, (req, res) => {
   const sender_id = req.session.user.id;
   const sender = req.session.user.username;
   const { content, receiverId } = req.body;
+
   if (!content || content.trim() === '') return res.status(400).send('پیام نمی‌تواند خالی باشد');
-  try {
-    await pool.query(
-      'INSERT INTO messages (sender_id, sender, receiver_id, content) VALUES ($1, $2, $3, $4)',
-      [sender_id, sender, receiverId || null, content]
-    );
+
+  const sql = 'INSERT INTO messages (sender_id, sender, receiver_id, content) VALUES (?, ?, ?, ?)';
+  db.run(sql, [sender_id, sender, receiverId || null, content], function (err) {
+    if (err) return res.status(500).send('خطا در ارسال پیام');
     res.send('پیام ارسال شد');
-  } catch {
-    res.status(500).send('خطا در ارسال پیام');
-  }
+  });
 });
 
-app.delete('/message/:id', requireLogin, requireAdmin, async (req, res) => {
+app.delete('/message/:id', requireLogin, requireAdmin, (req, res) => {
   const messageId = req.params.id;
-  try {
-    const result = await pool.query('DELETE FROM messages WHERE id = $1', [messageId]);
-    if (result.rowCount === 0) return res.status(404).send('پیام حذف نشد');
-    res.send('پیام حذف شد');
-  } catch {
-    res.status(500).send('خطا در حذف پیام');
-  }
+
+  db.get('SELECT * FROM messages WHERE id = ?', [messageId], (err, row) => {
+    if (err) {
+      return res.status(500).send('خطا در سرور');
+    }
+    if (!row) {
+      return res.status(404).send('پیام پیدا نشد');
+    }
+
+    db.run('DELETE FROM messages WHERE id = ?', [messageId], function (err2) {
+      if (err2) {
+        return res.status(500).send('خطا در حذف پیام');
+      }
+      if (this.changes === 0) {
+        return res.status(404).send('پیام حذف نشد');
+      }
+      res.send('پیام حذف شد');
+    });
+  });
 });
 
 app.post('/change-password', requireLogin, async (req, res) => {
   const userId = req.session.user.id;
   const { oldPassword, newPassword } = req.body;
+
   if (!oldPassword || !newPassword) return res.status(400).send('رمزهای عبور باید وارد شوند');
-  try {
-    const result = await pool.query('SELECT password FROM users WHERE id = $1', [userId]);
-    const user = result.rows[0];
-    if (!user) return res.status(404).send('کاربر یافت نشد');
-    const match = await bcrypt.compare(oldPassword, user.password);
+
+  db.get('SELECT password FROM users WHERE id = ?', [userId], async (err, row) => {
+    if (err) return res.status(500).send('خطا در سرور');
+    if (!row) return res.status(404).send('کاربر یافت نشد');
+
+    const match = await bcrypt.compare(oldPassword, row.password);
     if (!match) return res.status(400).send('رمز عبور فعلی اشتباه است');
+
     const hashed = await bcrypt.hash(newPassword, 10);
-    await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hashed, userId]);
-    res.send('رمز عبور با موفقیت تغییر کرد');
-  } catch {
-    res.status(500).send('خطا در به‌روزرسانی رمز عبور');
-  }
+    db.run('UPDATE users SET password = ? WHERE id = ?', [hashed, userId], function (err2) {
+      if (err2) return res.status(500).send('خطا در به‌روزرسانی رمز عبور');
+      res.send('رمز عبور با موفقیت تغییر کرد');
+    });
+  });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`سرور روی http://localhost:${PORT} اجرا شده`);
 });
