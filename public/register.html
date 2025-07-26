@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ثبت‌نام | پیام‌رسان پیشرفته</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 flex items-center justify-center min-h-screen">
+  <div class="bg-white p-8 rounded shadow max-w-md w-full">
+    <h1 class="text-2xl mb-6 text-center font-bold">ثبت‌نام در پیام‌رسان</h1>
+    <form id="registerForm" class="flex flex-col gap-4">
+      <input
+        type="text"
+        id="username"
+        placeholder="نام کاربری"
+        required
+        class="border p-2 rounded"
+      />
+      <input
+        type="password"
+        id="password"
+        placeholder="رمز عبور"
+        required
+        class="border p-2 rounded"
+      />
+      <button
+        type="submit"
+        class="bg-green-700 text-white py-2 rounded hover:bg-green-800 transition"
+      >
+        ثبت‌نام
+      </button>
+    </form>
+    <p class="mt-4 text-center">
+      قبلا ثبت‌نام کرده‌اید؟
+      <a href="/login.html" class="text-blue-700 hover:underline">ورود</a>
+    </p>
+  </div>
+
+  <script>
+    document.getElementById('registerForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value;
+
+      const res = await fetch('/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+
+      if (res.ok) {
+        alert('ثبت‌نام با موفقیت انجام شد. حالا وارد شوید.');
+        window.location.href = '/login.html';
+      } else {
+        const text = await res.text();
+        alert(text);
+      }
+    });
+  </script>
+</body>
+</html>
